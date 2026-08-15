@@ -1,0 +1,92 @@
+name: Watermark and Publish Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      media_data:
+        description: "Base64 Media"
+        required: true
+      media_type:
+        description: "video or image"
+        required: true
+        default: "video"
+      watermark_data:
+        description: "Base64 Watermark"
+        required: true
+      size_ratio:
+        description: "Size Ratio"
+        required: true
+        default: "0.20"
+      opacity:
+        description: "Opacity"
+        required: true
+        default: "0.85"
+      x_ratio:
+        description: "X Ratio"
+        required: true
+        default: "0.85"
+      y_ratio:
+        description: "Y Ratio"
+        required: true
+        default: "0.85"
+      caption:
+        description: "Telegram Caption"
+        required: false
+        default: ""
+      bot_token:
+        description: "Telegram Bot Token"
+        required: true
+      chat_id:
+        description: "Target Chat or Channel ID"
+        required: true
+
+jobs:
+  process-and-send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg curl
+
+      - name: Decode Input Files
+        run: |
+          echo "${{ github.event.inputs.media_data }}" | base64 --decode > input_media
+          echo "${{ github.event.inputs.watermark_data }}" | base64 --decode > watermark.png
+
+      - name: Apply Watermark with FFmpeg
+        run: |
+          SIZE="${{ github.event.inputs.size_ratio }}"
+          OPACITY="${{ github.event.inputs.opacity }}"
+          X_POS="${{ github.event.inputs.x_ratio }}"
+          Y_POS="${{ github.event.inputs.y_ratio }}"
+          
+          if [ "${{ github.event.inputs.media_type }}" = "video" ]; then
+            ffmpeg -y -i input_media -i watermark.png -filter_complex \
+            "[1:v][0:v]scale2ref=w='if(gt(main_w,main_h),main_w*${SIZE},-1)':h='if(gt(main_w,main_h),-1,main_h*${SIZE})'[wm][base]; \
+             [wm]format=rgba,colorchannelmixer=aa=${OPACITY}[wm_alpha]; \
+             [base][wm_alpha]overlay=W*${X_POS}-w/2:H*${Y_POS}-h/2" \
+            -codec:a copy -preset ultrafast output.mp4
+          else
+            ffmpeg -y -i input_media -i watermark.png -filter_complex \
+            "[1:v][0:v]scale2ref=w='if(gt(main_w,main_h),main_w*${SIZE},-1)':h='if(gt(main_w,main_h),-1,main_h*${SIZE})'[wm][base]; \
+             [wm]format=rgba,colorchannelmixer=aa=${OPACITY}[wm_alpha]; \
+             [base][wm_alpha]overlay=W*${X_POS}-w/2:H*${Y_POS}-h/2" \
+            output.jpg
+          fi
+
+      - name: Send to Telegram
+        run: |
+          TOKEN="${{ github.event.inputs.bot_token }}"
+          CHAT="${{ github.event.inputs.chat_id }}"
+          CAP="${{ github.event.inputs.caption }}"
+          
+          if [ "${{ github.event.inputs.media_type }}" = "video" ]; then
+            curl -s -F chat_id="$CHAT" \
+                 -F video=@output.mp4 \
+                 -F caption="$CAP" \
+                 "https://api.telegram.org/bot$TOKEN/sendVideo"
+          else
+            curl -s -F chat_id="$CHAT" \
+                 -F photo=@output.jpg \
+                 -F caption="$CAP" \
+                 "https://api.telegram.org/bot$TOKEN/sendPhoto"
+          fi
