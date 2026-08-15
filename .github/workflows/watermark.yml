@@ -3,16 +3,13 @@ name: Watermark and Publish Engine
 on:
   workflow_dispatch:
     inputs:
-      media_data:
-        description: "Base64 Media"
+      tag_name:
+        description: "Release tag containing uploaded media"
         required: true
       media_type:
         description: "video or image"
         required: true
         default: "video"
-      watermark_data:
-        description: "Base64 Watermark"
-        required: true
       size_ratio:
         description: "Size Ratio"
         required: true
@@ -43,14 +40,26 @@ on:
 jobs:
   process-and-send:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Install Tools
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg curl
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg curl jq
 
-      - name: Decode Input Files
+      - name: Download Uploaded Assets from Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag_name }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "${{ github.event.inputs.media_data }}" | base64 --decode > input_media
-          echo "${{ github.event.inputs.watermark_data }}" | base64 --decode > watermark.png
+          # دریافت لینک دانلود فایل‌ها از Release موقت
+          REL_JSON=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$REPO/releases/tags/$TAG")
+          
+          MEDIA_URL=$(echo "$REL_JSON" | jq -r '.assets[] | select(.name=="input_media") | .browser_download_url')
+          WM_URL=$(echo "$REL_JSON" | jq -r '.assets[] | select(.name=="watermark.png") | .browser_download_url')
+          
+          curl -sL -o input_media "$MEDIA_URL"
+          curl -sL -o watermark.png "$WM_URL"
 
       - name: Apply Watermark with FFmpeg
         run: |
@@ -73,20 +82,33 @@ jobs:
             output.jpg
           fi
 
-      - name: Send to Telegram
+      - name: Send Direct to Telegram
+        env:
+          TOKEN: ${{ github.event.inputs.bot_token }}
+          CHAT: ${{ github.event.inputs.chat_id }}
+          CAP: ${{ github.event.inputs.caption }}
         run: |
-          TOKEN="${{ github.event.inputs.bot_token }}"
-          CHAT="${{ github.event.inputs.chat_id }}"
-          CAP="${{ github.event.inputs.caption }}"
-          
           if [ "${{ github.event.inputs.media_type }}" = "video" ]; then
-            curl -s -F chat_id="$CHAT" \
+            curl -F chat_id="$CHAT" \
                  -F video=@output.mp4 \
                  -F caption="$CAP" \
                  "https://api.telegram.org/bot$TOKEN/sendVideo"
           else
-            curl -s -F chat_id="$CHAT" \
+            curl -F chat_id="$CHAT" \
                  -F photo=@output.jpg \
                  -F caption="$CAP" \
                  "https://api.telegram.org/bot$TOKEN/sendPhoto"
+          fi
+
+      - name: Cleanup Temporary Release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          REL_ID=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$REPO/releases/tags/$TAG" | jq -r '.id')
+          if [ "$REL_ID" != "null" ]; then
+            curl -s -X DELETE -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$REPO/releases/$REL_ID"
+            curl -s -X DELETE -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$REPO/git/refs/tags/$TAG"
           fi
