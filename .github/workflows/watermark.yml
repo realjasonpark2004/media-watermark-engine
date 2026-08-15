@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: "Job identifier folder"
+        description: "Job identifier"
         required: true
       media_type:
         description: "video or image"
@@ -43,73 +43,89 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Install FFmpeg & Tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg curl jq
 
-      - name: Sync Latest Commits
+      - name: Download Raw Assets Directly
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          JOB: ${{ github.event.inputs.job_id }}
         run: |
-          git pull origin main
+          mkdir -p workspace
+          curl -s -H "Authorization: token $GH_TOKEN" \
+               -H "Accept: application/vnd.github.v3.raw" \
+               -o workspace/input_media \
+               "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media"
+          
+          curl -s -H "Authorization: token $GH_TOKEN" \
+               -H "Accept: application/vnd.github.v3.raw" \
+               -o workspace/watermark.png \
+               "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png"
+          
+          echo "Verifying downloaded files:"
+          ls -lh workspace/
 
-      - name: Install FFmpeg
+      - name: Process Media with FFmpeg
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg curl jq
-
-      - name: Apply Watermark with FFmpeg
-        run: |
-          JOB_DIR="temp_jobs/${{ github.event.inputs.job_id }}"
           SIZE="${{ github.event.inputs.size_ratio }}"
           OPACITY="${{ github.event.inputs.opacity }}"
           X_POS="${{ github.event.inputs.x_ratio }}"
           Y_POS="${{ github.event.inputs.y_ratio }}"
           
-          echo "Processing files from: $JOB_DIR"
-          ls -la "$JOB_DIR"
-
           if [ "${{ github.event.inputs.media_type }}" = "video" ]; then
-            ffmpeg -y -i "$JOB_DIR/input_media" -i "$JOB_DIR/watermark.png" -filter_complex \
+            ffmpeg -y -i workspace/input_media -i workspace/watermark.png -filter_complex \
             "[1:v][0:v]scale2ref=w='if(gt(main_w,main_h),main_w*${SIZE},-1)':h='if(gt(main_w,main_h),-1,main_h*${SIZE})'[wm][base]; \
              [wm]format=rgba,colorchannelmixer=aa=${OPACITY}[wm_alpha]; \
              [base][wm_alpha]overlay=W*${X_POS}-w/2:H*${Y_POS}-h/2" \
-            -codec:a copy -preset ultrafast output.mp4
+            -codec:a copy -preset ultrafast workspace/output.mp4
           else
-            ffmpeg -y -i "$JOB_DIR/input_media" -i "$JOB_DIR/watermark.png" -filter_complex \
+            ffmpeg -y -i workspace/input_media -i workspace/watermark.png -filter_complex \
             "[1:v][0:v]scale2ref=w='if(gt(main_w,main_h),main_w*${SIZE},-1)':h='if(gt(main_w,main_h),-1,main_h*${SIZE})'[wm][base]; \
              [wm]format=rgba,colorchannelmixer=aa=${OPACITY}[wm_alpha]; \
              [base][wm_alpha]overlay=W*${X_POS}-w/2:H*${Y_POS}-h/2" \
-            output.jpg
+            workspace/output.jpg
           fi
+          
+          echo "Output files ready:"
+          ls -lh workspace/output.*
 
-          echo "Check output files:"
-          ls -lh output.*
-
-      - name: Send Direct to Telegram
+      - name: Send Direct to Telegram Channel
         env:
           TOKEN: ${{ github.event.inputs.bot_token }}
           CHAT: ${{ github.event.inputs.chat_id }}
           CAP: ${{ github.event.inputs.caption }}
         run: |
-          echo "Sending to Telegram Chat: $CHAT"
           if [ "${{ github.event.inputs.media_type }}" = "video" ]; then
-            RESP=$(curl -s -F chat_id="$CHAT" -F video=@output.mp4 -F caption="$CAP" "https://api.telegram.org/bot$TOKEN/sendVideo")
+            RESP=$(curl -s -F chat_id="$CHAT" -F video=@workspace/output.mp4 -F caption="$CAP" "https://api.telegram.org/bot$TOKEN/sendVideo")
           else
-            RESP=$(curl -s -F chat_id="$CHAT" -F photo=@output.jpg -F caption="$CAP" "https://api.telegram.org/bot$TOKEN/sendPhoto")
+            RESP=$(curl -s -F chat_id="$CHAT" -F photo=@workspace/output.jpg -F caption="$CAP" "https://api.telegram.org/bot$TOKEN/sendPhoto")
           fi
           
-          echo "Response from Telegram: $RESP"
+          echo "Telegram API Response: $RESP"
           IS_OK=$(echo "$RESP" | jq -r '.ok')
           if [ "$IS_OK" != "true" ]; then
-            echo "Error from Telegram API!"
+            echo "Failed to send to Telegram channel."
             exit 1
           fi
 
       - name: Cleanup Temp Job Files
         if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          JOB: ${{ github.event.inputs.job_id }}
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git pull origin main || true
-          git rm -r -f "temp_jobs/${{ github.event.inputs.job_id }}" || true
-          git commit -m "cleanup: job ${{ github.event.inputs.job_id }}" || true
-          git push origin main || true
+          M_SHA=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media" | jq -r '.sha')
+          W_SHA=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png" | jq -r '.sha')
+          
+          if [ "$M_SHA" != "null" ]; then
+            curl -s -X DELETE -H "Authorization: token $GH_TOKEN" \
+                 -d "{\"message\":\"cleanup\",\"sha\":\"$M_SHA\"}" \
+                 "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media"
+          fi
+          if [ "$W_SHA" != "null" ]; then
+            curl -s -X DELETE -H "Authorization: token $GH_TOKEN" \
+                 -d "{\"message\":\"cleanup\",\"sha\":\"$W_SHA\"}" \
+                 "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png"
+          fi
