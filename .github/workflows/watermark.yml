@@ -9,7 +9,7 @@ on:
       media_type:
         description: "video or image"
         required: true
-        default: "video"
+        default: "image"
       size_ratio:
         description: "Size Ratio"
         required: true
@@ -43,36 +43,25 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
       - name: Install FFmpeg & Tools
         run: sudo apt-get update && sudo apt-get install -y ffmpeg curl jq
 
-      - name: Fetch and Decode Files
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          JOB: ${{ github.event.inputs.job_id }}
+      - name: Prepare Input Media
         run: |
-          mkdir -p workspace
-          
-          # دریافت محتوای Base64 مستقیم از API و دیکود به فایل باینری
-          curl -s -H "Authorization: Bearer $GH_TOKEN" \
-               "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media" \
-               | jq -r '.content' | tr -d '\n\r ' | base64 --decode > workspace/input_media
+          JOB_PATH="temp_jobs/${{ github.event.inputs.job_id }}"
+          echo "Checking directory: $JOB_PATH"
+          ls -la "$JOB_PATH"
 
-          curl -s -H "Authorization: Bearer $GH_TOKEN" \
-               "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png" \
-               | jq -r '.content' | tr -d '\n\r ' | base64 --decode > workspace/watermark.png
+          cp "$JOB_PATH/input_media" ./input_file
+          cp "$JOB_PATH/watermark.png" ./watermark_file.png
 
-          echo "=== بررسی حجم فایل‌های دانلود شده ==="
-          ls -lh workspace/
-
-          # اگر فایل ورودی خالی بود اکشن را متوقف کن
-          if [ ! -s workspace/input_media ]; then
-            echo "خطا: فایل ورودی خالی است!"
-            exit 1
-          fi
-
-      - name: Apply Watermark with FFmpeg
+      - name: Apply Watermark
         run: |
           SIZE="${{ github.event.inputs.size_ratio }}"
           OPACITY="${{ github.event.inputs.opacity }}"
@@ -80,59 +69,56 @@ jobs:
           Y_POS="${{ github.event.inputs.y_ratio }}"
           
           if [ "${{ github.event.inputs.media_type }}" = "video" ]; then
-            ffmpeg -y -i workspace/input_media -i workspace/watermark.png -filter_complex \
-            "[1:v][0:v]scale2ref=w='if(gt(main_w,main_h),main_w*${SIZE},-1)':h='if(gt(main_w,main_h),-1,main_h*${SIZE})'[wm][base]; \
+            ffmpeg -y -i ./input_file -i ./watermark_file.png -filter_complex \
+            "[0:v][1:v]scale2ref=w=iw*${SIZE}:h=-1[main][wm]; \
              [wm]format=rgba,colorchannelmixer=aa=${OPACITY}[wm_alpha]; \
-             [base][wm_alpha]overlay=W*${X_POS}-w/2:H*${Y_POS}-h/2" \
-            -codec:a copy -preset ultrafast workspace/output.mp4
+             [main][wm_alpha]overlay=W*${X_POS}-w/2:H*${Y_POS}-h/2" \
+            -c:a copy ./output_media.mp4
           else
-            ffmpeg -y -i workspace/input_media -i workspace/watermark.png -filter_complex \
-            "[1:v][0:v]scale2ref=w='if(gt(main_w,main_h),main_w*${SIZE},-1)':h='if(gt(main_w,main_h),-1,main_h*${SIZE})'[wm][base]; \
+            ffmpeg -y -i ./input_file -i ./watermark_file.png -filter_complex \
+            "[0:v][1:v]scale2ref=w=iw*${SIZE}:h=-1[main][wm]; \
              [wm]format=rgba,colorchannelmixer=aa=${OPACITY}[wm_alpha]; \
-             [base][wm_alpha]overlay=W*${X_POS}-w/2:H*${Y_POS}-h/2" \
-            workspace/output.jpg
+             [main][wm_alpha]overlay=W*${X_POS}-w/2:H*${Y_POS}-h/2" \
+            ./output_media.jpg
           fi
 
-          echo "=== فایل نهایی پردازش شده ==="
-          ls -lh workspace/output.*
+          echo "Verifying processed file:"
+          ls -lh ./output_media.*
 
-      - name: Send Direct to Telegram
+      - name: Send to Telegram
         env:
-          TOKEN: ${{ github.event.inputs.bot_token }}
-          CHAT: ${{ github.event.inputs.chat_id }}
-          CAP: ${{ github.event.inputs.caption }}
-          TYPE: ${{ github.event.inputs.media_type }}
+          BOT_TOKEN: ${{ github.event.inputs.bot_token }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          CAPTION: ${{ github.event.inputs.caption }}
+          MEDIA_TYPE: ${{ github.event.inputs.media_type }}
         run: |
-          echo "ارسال به مقصد: $CHAT"
+          echo "Sending to Telegram Destination: $CHAT_ID"
           
-          if [ "$TYPE" = "video" ]; then
-            RESP=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendVideo" \
-                 -F "chat_id=${CHAT}" \
-                 -F "video=@workspace/output.mp4" \
-                 -F "caption=${CAP}")
+          if [ "$MEDIA_TYPE" = "video" ]; then
+            RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendVideo" \
+                 -F "chat_id=${CHAT_ID}" \
+                 -F "video=@output_media.mp4" \
+                 -F "caption=${CAPTION}")
           else
-            RESP=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
-                 -F "chat_id=${CHAT}" \
-                 -F "photo=@workspace/output.jpg" \
-                 -F "caption=${CAP}")
+            RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+                 -F "chat_id=${CHAT_ID}" \
+                 -F "photo=@output_media.jpg" \
+                 -F "caption=${CAPTION}")
           fi
 
-          echo "پاسخ سرور تلگرام: $RESP"
-          OK=$(echo "$RESP" | jq -r '.ok')
-          if [ "$OK" != "true" ]; then
-            echo "خطا در ارسال به تلگرام!"
+          echo "Response: $RESPONSE"
+          IS_OK=$(echo "$RESPONSE" | jq -r '.ok')
+          if [ "$IS_OK" != "true" ]; then
+            echo "Telegram Delivery Failed!"
             exit 1
           fi
 
-      - name: Cleanup Temp Files
+      - name: Cleanup Temp Job Files
         if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          JOB: ${{ github.event.inputs.job_id }}
         run: |
-          M_SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media" | jq -r '.sha')
-          W_SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png" | jq -r '.sha')
-          
-          [ "$M_SHA" != "null" ] && curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" -d "{\"message\":\"cleanup\",\"sha\":\"$M_SHA\"}" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media"
-          [ "$W_SHA" != "null" ] && curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" -d "{\"message\":\"cleanup\",\"sha\":\"$W_SHA\"}" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin main || true
+          git rm -r -f "temp_jobs/${{ github.event.inputs.job_id }}" || true
+          git commit -m "cleanup temp job ${{ github.event.inputs.job_id }}" || true
+          git push origin main || true
