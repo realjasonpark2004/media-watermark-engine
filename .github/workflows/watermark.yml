@@ -43,11 +43,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install FFmpeg & Tools
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg curl
+      - name: Sync Latest Commits
+        run: |
+          git pull origin main
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg curl jq
 
       - name: Apply Watermark with FFmpeg
         run: |
@@ -57,6 +64,9 @@ jobs:
           X_POS="${{ github.event.inputs.x_ratio }}"
           Y_POS="${{ github.event.inputs.y_ratio }}"
           
+          echo "Processing files from: $JOB_DIR"
+          ls -la "$JOB_DIR"
+
           if [ "${{ github.event.inputs.media_type }}" = "video" ]; then
             ffmpeg -y -i "$JOB_DIR/input_media" -i "$JOB_DIR/watermark.png" -filter_complex \
             "[1:v][0:v]scale2ref=w='if(gt(main_w,main_h),main_w*${SIZE},-1)':h='if(gt(main_w,main_h),-1,main_h*${SIZE})'[wm][base]; \
@@ -71,29 +81,35 @@ jobs:
             output.jpg
           fi
 
-      - name: Send to Telegram
+          echo "Check output files:"
+          ls -lh output.*
+
+      - name: Send Direct to Telegram
         env:
           TOKEN: ${{ github.event.inputs.bot_token }}
           CHAT: ${{ github.event.inputs.chat_id }}
           CAP: ${{ github.event.inputs.caption }}
         run: |
+          echo "Sending to Telegram Chat: $CHAT"
           if [ "${{ github.event.inputs.media_type }}" = "video" ]; then
-            curl -F chat_id="$CHAT" \
-                 -F video=@output.mp4 \
-                 -F caption="$CAP" \
-                 "https://api.telegram.org/bot$TOKEN/sendVideo"
+            RESP=$(curl -s -F chat_id="$CHAT" -F video=@output.mp4 -F caption="$CAP" "https://api.telegram.org/bot$TOKEN/sendVideo")
           else
-            curl -F chat_id="$CHAT" \
-                 -F photo=@output.jpg \
-                 -F caption="$CAP" \
-                 "https://api.telegram.org/bot$TOKEN/sendPhoto"
+            RESP=$(curl -s -F chat_id="$CHAT" -F photo=@output.jpg -F caption="$CAP" "https://api.telegram.org/bot$TOKEN/sendPhoto")
+          fi
+          
+          echo "Response from Telegram: $RESP"
+          IS_OK=$(echo "$RESP" | jq -r '.ok')
+          if [ "$IS_OK" != "true" ]; then
+            echo "Error from Telegram API!"
+            exit 1
           fi
 
-      - name: Cleanup Temp Job Directory
+      - name: Cleanup Temp Job Files
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin main || true
           git rm -r -f "temp_jobs/${{ github.event.inputs.job_id }}" || true
-          git commit -m "cleanup: remove temp job ${{ github.event.inputs.job_id }}" || true
+          git commit -m "cleanup: job ${{ github.event.inputs.job_id }}" || true
           git push origin main || true
