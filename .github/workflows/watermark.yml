@@ -46,27 +46,33 @@ jobs:
       - name: Install FFmpeg & Tools
         run: sudo apt-get update && sudo apt-get install -y ffmpeg curl jq
 
-      - name: Download Raw Assets Directly
+      - name: Fetch and Decode Files
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           JOB: ${{ github.event.inputs.job_id }}
         run: |
           mkdir -p workspace
-          curl -s -H "Authorization: token $GH_TOKEN" \
-               -H "Accept: application/vnd.github.v3.raw" \
-               -o workspace/input_media \
-               "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media"
           
-          curl -s -H "Authorization: token $GH_TOKEN" \
-               -H "Accept: application/vnd.github.v3.raw" \
-               -o workspace/watermark.png \
-               "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png"
-          
-          echo "Verifying downloaded files:"
+          # دریافت محتوای Base64 مستقیم از API و دیکود به فایل باینری
+          curl -s -H "Authorization: Bearer $GH_TOKEN" \
+               "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media" \
+               | jq -r '.content' | tr -d '\n\r ' | base64 --decode > workspace/input_media
+
+          curl -s -H "Authorization: Bearer $GH_TOKEN" \
+               "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png" \
+               | jq -r '.content' | tr -d '\n\r ' | base64 --decode > workspace/watermark.png
+
+          echo "=== بررسی حجم فایل‌های دانلود شده ==="
           ls -lh workspace/
 
-      - name: Process Media with FFmpeg
+          # اگر فایل ورودی خالی بود اکشن را متوقف کن
+          if [ ! -s workspace/input_media ]; then
+            echo "خطا: فایل ورودی خالی است!"
+            exit 1
+          fi
+
+      - name: Apply Watermark with FFmpeg
         run: |
           SIZE="${{ github.event.inputs.size_ratio }}"
           OPACITY="${{ github.event.inputs.opacity }}"
@@ -86,46 +92,47 @@ jobs:
              [base][wm_alpha]overlay=W*${X_POS}-w/2:H*${Y_POS}-h/2" \
             workspace/output.jpg
           fi
-          
-          echo "Output files ready:"
+
+          echo "=== فایل نهایی پردازش شده ==="
           ls -lh workspace/output.*
 
-      - name: Send Direct to Telegram Channel
+      - name: Send Direct to Telegram
         env:
           TOKEN: ${{ github.event.inputs.bot_token }}
           CHAT: ${{ github.event.inputs.chat_id }}
           CAP: ${{ github.event.inputs.caption }}
+          TYPE: ${{ github.event.inputs.media_type }}
         run: |
-          if [ "${{ github.event.inputs.media_type }}" = "video" ]; then
-            RESP=$(curl -s -F chat_id="$CHAT" -F video=@workspace/output.mp4 -F caption="$CAP" "https://api.telegram.org/bot$TOKEN/sendVideo")
-          else
-            RESP=$(curl -s -F chat_id="$CHAT" -F photo=@workspace/output.jpg -F caption="$CAP" "https://api.telegram.org/bot$TOKEN/sendPhoto")
-          fi
+          echo "ارسال به مقصد: $CHAT"
           
-          echo "Telegram API Response: $RESP"
-          IS_OK=$(echo "$RESP" | jq -r '.ok')
-          if [ "$IS_OK" != "true" ]; then
-            echo "Failed to send to Telegram channel."
+          if [ "$TYPE" = "video" ]; then
+            RESP=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendVideo" \
+                 -F "chat_id=${CHAT}" \
+                 -F "video=@workspace/output.mp4" \
+                 -F "caption=${CAP}")
+          else
+            RESP=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendPhoto" \
+                 -F "chat_id=${CHAT}" \
+                 -F "photo=@workspace/output.jpg" \
+                 -F "caption=${CAP}")
+          fi
+
+          echo "پاسخ سرور تلگرام: $RESP"
+          OK=$(echo "$RESP" | jq -r '.ok')
+          if [ "$OK" != "true" ]; then
+            echo "خطا در ارسال به تلگرام!"
             exit 1
           fi
 
-      - name: Cleanup Temp Job Files
+      - name: Cleanup Temp Files
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           JOB: ${{ github.event.inputs.job_id }}
         run: |
-          M_SHA=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media" | jq -r '.sha')
-          W_SHA=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png" | jq -r '.sha')
+          M_SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media" | jq -r '.sha')
+          W_SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png" | jq -r '.sha')
           
-          if [ "$M_SHA" != "null" ]; then
-            curl -s -X DELETE -H "Authorization: token $GH_TOKEN" \
-                 -d "{\"message\":\"cleanup\",\"sha\":\"$M_SHA\"}" \
-                 "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media"
-          fi
-          if [ "$W_SHA" != "null" ]; then
-            curl -s -X DELETE -H "Authorization: token $GH_TOKEN" \
-                 -d "{\"message\":\"cleanup\",\"sha\":\"$W_SHA\"}" \
-                 "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png"
-          fi
+          [ "$M_SHA" != "null" ] && curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" -d "{\"message\":\"cleanup\",\"sha\":\"$M_SHA\"}" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/input_media"
+          [ "$W_SHA" != "null" ] && curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" -d "{\"message\":\"cleanup\",\"sha\":\"$W_SHA\"}" "https://api.github.com/repos/$REPO/contents/temp_jobs/$JOB/watermark.png"
